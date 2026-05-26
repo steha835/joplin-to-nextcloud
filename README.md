@@ -32,16 +32,17 @@ python3 joplin_to_nextcloud.py
 ## Usage
 
 ```
-python3 joplin_to_nextcloud.py [--dry-run] [--diff]
+python3 joplin_to_nextcloud.py [--dry-run] [--diff] [--reverse-diff]
 ```
 
 | Flag | Description |
 |------|-------------|
 | *(no flag)* | Full migration -- writes all notes and copies resources |
 | `--dry-run` | Shows what would be created without writing any files |
-| `--diff` | Compares timestamps and lists only new or modified notes |
+| `--diff` | Lists Joplin notes that are new or modified compared to Nextcloud |
+| `--reverse-diff` | Lists Nextcloud notes that are new or modified compared to Joplin |
 
-### Diff Mode
+### Diff Mode (Joplin → Nextcloud)
 
 After the initial migration, use `--diff` to check what changed in Joplin:
 
@@ -57,6 +58,26 @@ $ python3 joplin_to_nextcloud.py --diff
   New notes:         1
   Modified notes:    1
   Unchanged notes:   380
+```
+
+### Reverse Diff (Nextcloud → Joplin)
+
+Use `--reverse-diff` to find notes that were added or edited in Nextcloud and need to be manually imported into Joplin:
+
+```
+$ python3 joplin_to_nextcloud.py --reverse-diff
+
+=== REVERSE DIFF -- Nextcloud notes not in Joplin or newer ===
+
+  NEW in Nextcloud:      01_Home/New Note.md               (2026-05-26 20:29)
+  MODIFIED in Nextcloud: 01_Home/Shopping List.md           (NC: 2026-05-26 20:56 > Joplin: 2026-05-20 18:41)
+
+=== REVERSE DIFF SUMMARY ===
+  New in Nextcloud:      1
+  Modified in Nextcloud: 1
+  Unchanged:             380
+
+  2 note(s) to review for Joplin import.
 ```
 
 ## Default Paths
