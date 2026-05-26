@@ -7,7 +7,7 @@ into a local Nextcloud sync folder. Resources (images, attachments) are
 copied alongside the notes.
 
 Usage:
-    python3 joplin_to_nextcloud.py [--dry-run] [--diff]
+    python3 joplin_to_nextcloud.py [--dry-run] [--diff] [--reverse-diff]
 """
 
 import argparse
@@ -160,6 +160,78 @@ def classify_note(full_path: Path, utime: int) -> str:
     return "unchanged"
 
 
+def reverse_diff():
+    """Find Nextcloud notes that are new or modified compared to Joplin."""
+    from datetime import datetime, timezone
+
+    if not JOPLIN_DB.exists():
+        print(f"ERROR: Joplin database not found at {JOPLIN_DB}")
+        sys.exit(1)
+
+    conn = sqlite3.connect(f"file:{JOPLIN_DB}?mode=ro", uri=True)
+    cur = conn.cursor()
+
+    folders = build_folder_tree(cur)
+
+    # Build a set of known Nextcloud paths with their Joplin updated_time
+    joplin_notes = {}
+    cur.execute("""
+        SELECT id, title, parent_id, updated_time, markup_language
+        FROM notes
+        WHERE deleted_time = 0 AND is_conflict = 0
+    """)
+    used_paths = set()
+    for nid, title, parent_id, utime, markup in cur.fetchall():
+        if markup == 2:
+            continue
+        folder_path = folders[parent_id]["path"] if parent_id in folders else ""
+        filename = sanitize_filename(title) + ".md"
+        note_path = os.path.join(folder_path, filename)
+        if note_path.lower() in used_paths:
+            filename = f"{sanitize_filename(title)}_{nid[:8]}.md"
+            note_path = os.path.join(folder_path, filename)
+        used_paths.add(note_path.lower())
+        joplin_notes[note_path.lower()] = {"path": note_path, "utime": utime}
+
+    conn.close()
+
+    # Walk the Nextcloud Notes folder for .md files
+    print(f"=== REVERSE DIFF — Nextcloud notes not in Joplin or newer ===\n")
+    stats = {"new": 0, "modified": 0, "unchanged": 0, "skipped": 0}
+
+    for root, dirs, files in os.walk(NEXTCLOUD_NOTES):
+        # Skip the attachments directory
+        dirs[:] = [d for d in dirs if d != ATTACHMENTS_DIR]
+        for fname in files:
+            if not fname.endswith(".md"):
+                continue
+            full_path = Path(root) / fname
+            rel_path = str(full_path.relative_to(NEXTCLOUD_NOTES))
+            nc_mtime = full_path.stat().st_mtime
+            nc_dt = datetime.fromtimestamp(nc_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+            match = joplin_notes.get(rel_path.lower())
+            if match is None:
+                print(f"  NEW in Nextcloud:      {rel_path}  ({nc_dt})")
+                stats["new"] += 1
+            elif nc_mtime > match["utime"] / 1000 + 1:
+                joplin_dt = datetime.fromtimestamp(match["utime"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                print(f"  MODIFIED in Nextcloud: {rel_path}  (NC: {nc_dt} > Joplin: {joplin_dt})")
+                stats["modified"] += 1
+            else:
+                stats["unchanged"] += 1
+
+    print(f"\n=== REVERSE DIFF SUMMARY ===")
+    print(f"  New in Nextcloud:      {stats['new']}")
+    print(f"  Modified in Nextcloud: {stats['modified']}")
+    print(f"  Unchanged:             {stats['unchanged']}")
+    total_changes = stats['new'] + stats['modified']
+    if total_changes == 0:
+        print("\n  Everything is in sync.")
+    else:
+        print(f"\n  {total_changes} note(s) to review for Joplin import.")
+
+
 def migrate(dry_run: bool = False, diff: bool = False):
     if not JOPLIN_DB.exists():
         print(f"ERROR: Joplin database not found at {JOPLIN_DB}")
@@ -295,5 +367,10 @@ if __name__ == "__main__":
                         help="Show what would be done without writing files")
     parser.add_argument("--diff", action="store_true",
                         help="Show only new/modified notes since last sync")
+    parser.add_argument("--reverse-diff", action="store_true",
+                        help="Find Nextcloud notes that are new or modified compared to Joplin")
     args = parser.parse_args()
-    migrate(dry_run=args.dry_run, diff=args.diff)
+    if args.reverse_diff:
+        reverse_diff()
+    else:
+        migrate(dry_run=args.dry_run, diff=args.diff)
