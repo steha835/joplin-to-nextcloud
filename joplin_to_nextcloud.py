@@ -7,7 +7,7 @@ into a local Nextcloud sync folder. Resources (images, attachments) are
 copied alongside the notes.
 
 Usage:
-    python3 joplin_to_nextcloud.py [--dry-run]
+    python3 joplin_to_nextcloud.py [--dry-run] [--diff]
 """
 
 import argparse
@@ -146,7 +146,21 @@ def rewrite_resource_links(body: str, resources: dict, note_folder_path: str,
     return re.sub(r'\(:/([a-f0-9]{32})\)', replace_match, body)
 
 
-def migrate(dry_run: bool = False):
+def classify_note(full_path: Path, utime: int) -> str:
+    """Compare a Joplin note against its Nextcloud counterpart.
+
+    Returns: 'new', 'modified', 'unchanged'
+    """
+    if not full_path.exists():
+        return "new"
+    nc_mtime = full_path.stat().st_mtime
+    joplin_mtime = utime / 1000
+    if joplin_mtime > nc_mtime + 1:
+        return "modified"
+    return "unchanged"
+
+
+def migrate(dry_run: bool = False, diff: bool = False):
     if not JOPLIN_DB.exists():
         print(f"ERROR: Joplin database not found at {JOPLIN_DB}")
         sys.exit(1)
@@ -168,13 +182,18 @@ def migrate(dry_run: bool = False):
 
     print(f"Found {len(notes)} notes in {len(folders)} folders")
     print(f"Found {len(resources)} resources")
-    if dry_run:
+    if diff:
+        print("=== DIFF MODE — showing changes since last sync ===\n")
+    elif dry_run:
         print("=== DRY RUN — no files will be written ===\n")
 
     attachments_base = NEXTCLOUD_NOTES / ATTACHMENTS_DIR
     copied_resources = set()
     used_paths = set()
-    stats = {"notes": 0, "resources": 0, "skipped_html": 0, "errors": 0}
+    stats = {
+        "notes": 0, "resources": 0, "skipped_html": 0, "errors": 0,
+        "new": 0, "modified": 0, "unchanged": 0,
+    }
 
     for nid, title, body, parent_id, is_todo, todo_completed, ctime, utime, markup in notes:
         if markup == 2:
@@ -195,51 +214,86 @@ def migrate(dry_run: bool = False):
 
         full_path = NEXTCLOUD_NOTES / note_path
 
-        # Add todo checkbox prefix if it's a todo item
-        if is_todo:
-            checkbox = "[x]" if todo_completed else "[ ]"
-            body = f"**TODO {checkbox}**\n\n{body}"
+        status = classify_note(full_path, utime)
+        stats[status] += 1
 
-        # Rewrite resource links
-        prev_copied = len(copied_resources)
-        body = rewrite_resource_links(
-            body, resources, folder_path, attachments_base, copied_resources, dry_run
-        )
-        new_resources = len(copied_resources) - prev_copied
+        if diff:
+            if status == "unchanged":
+                continue
+            from datetime import datetime, timezone
+            joplin_dt = datetime.fromtimestamp(utime / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            if status == "new":
+                print(f"  NEW:      {note_path}  (Joplin: {joplin_dt})")
+            else:
+                nc_dt = datetime.fromtimestamp(full_path.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+                print(f"  MODIFIED: {note_path}  (Joplin: {joplin_dt} > Nextcloud: {nc_dt})")
+            continue
 
         if dry_run:
+            # Add todo checkbox prefix if it's a todo item
+            if is_todo:
+                checkbox = "[x]" if todo_completed else "[ ]"
+                body = f"**TODO {checkbox}**\n\n{body}"
+
             action = "WOULD CREATE"
         else:
+            # Add todo checkbox prefix if it's a todo item
+            if is_todo:
+                checkbox = "[x]" if todo_completed else "[ ]"
+                body = f"**TODO {checkbox}**\n\n{body}"
+
+            # Rewrite resource links
+            prev_copied = len(copied_resources)
+            body = rewrite_resource_links(
+                body, resources, folder_path, attachments_base, copied_resources, dry_run
+            )
+            new_resources = len(copied_resources) - prev_copied
+
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(body, encoding="utf-8")
 
-            # Set file timestamps
             if ctime and utime:
                 os.utime(full_path, (utime / 1000, utime / 1000))
             action = "CREATED"
 
         stats["notes"] += 1
-        stats["resources"] += new_resources
-        res_info = f" (+{new_resources} resources)" if new_resources else ""
-        print(f"  {action}: {note_path}{res_info}")
+        if not diff:
+            # Rewrite resource links for dry-run display
+            if dry_run:
+                prev_copied = len(copied_resources)
+                body = rewrite_resource_links(
+                    body, resources, folder_path, attachments_base, copied_resources, dry_run
+                )
+                new_resources = len(copied_resources) - prev_copied
+            res_info = f" (+{new_resources} resources)" if new_resources else ""
+            print(f"  {action}: {note_path}{res_info}")
 
     conn.close()
 
-    print(f"\n{'=== DRY RUN SUMMARY ===' if dry_run else '=== SUMMARY ==='}")
-    print(f"  Notes migrated:    {stats['notes']}")
-    print(f"  Resources copied:  {stats['resources']}")
-    print(f"  Skipped (HTML):    {stats['skipped_html']}")
-    print(f"  Total resources:   {len(copied_resources)} unique files")
+    if diff:
+        print(f"\n=== DIFF SUMMARY ===")
+        print(f"  New notes:         {stats['new']}")
+        print(f"  Modified notes:    {stats['modified']}")
+        print(f"  Unchanged notes:   {stats['unchanged']}")
+        print(f"  Skipped (HTML):    {stats['skipped_html']}")
+    else:
+        print(f"\n{'=== DRY RUN SUMMARY ===' if dry_run else '=== SUMMARY ==='}")
+        print(f"  Notes migrated:    {stats['notes']}")
+        print(f"  Resources copied:  {stats['resources']}")
+        print(f"  Skipped (HTML):    {stats['skipped_html']}")
+        print(f"  Total resources:   {len(copied_resources)} unique files")
 
-    if not dry_run:
-        print(f"\nNotes written to: {NEXTCLOUD_NOTES}")
-        print(f"Attachments in:   {attachments_base}")
-        print("\nThe Nextcloud Desktop Client will sync these files automatically.")
+        if not dry_run:
+            print(f"\nNotes written to: {NEXTCLOUD_NOTES}")
+            print(f"Attachments in:   {attachments_base}")
+            print("\nThe Nextcloud Desktop Client will sync these files automatically.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Migrate Joplin notes to Nextcloud Notes")
     parser.add_argument("--dry-run", action="store_true",
                         help="Show what would be done without writing files")
+    parser.add_argument("--diff", action="store_true",
+                        help="Show only new/modified notes since last sync")
     args = parser.parse_args()
-    migrate(dry_run=args.dry_run)
+    migrate(dry_run=args.dry_run, diff=args.diff)
