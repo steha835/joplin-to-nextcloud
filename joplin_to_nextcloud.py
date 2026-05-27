@@ -1,21 +1,27 @@
 #!/usr/bin/env python3
 """
-Migrate Joplin notes to Nextcloud Notes.
+Migrate Joplin notes to Nextcloud Notes (and back).
 
-Reads directly from the Joplin SQLite database and writes markdown files
-into a local Nextcloud sync folder. Resources (images, attachments) are
-copied alongside the notes.
+Joplin → Nextcloud: Reads from the Joplin SQLite database, writes markdown
+files into a local Nextcloud sync folder with resources.
+
+Nextcloud → Joplin: Reads changed markdown files from Nextcloud, pushes
+them into Joplin via the REST API (Web Clipper). Text only, no attachments.
 
 Usage:
     python3 joplin_to_nextcloud.py [--dry-run] [--diff] [--reverse-diff]
+    python3 joplin_to_nextcloud.py --sync-to-joplin [--dry-run]
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import sqlite3
 import sys
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 JOPLIN_DB = Path.home() / ".config/joplin-desktop/database.sqlite"
@@ -361,16 +367,261 @@ def migrate(dry_run: bool = False, diff: bool = False):
             print("\nThe Nextcloud Desktop Client will sync these files automatically.")
 
 
+## ---------------------------------------------------------------------------
+## Joplin REST API helpers (Web Clipper API on localhost)
+## ---------------------------------------------------------------------------
+
+JOPLIN_API_PORT = 41184
+_api_token_cache = None
+
+
+def _get_api_token():
+    global _api_token_cache
+    if _api_token_cache:
+        return _api_token_cache
+    settings_path = Path.home() / ".config/joplin-desktop/settings.json"
+    if not settings_path.exists():
+        print("ERROR: Joplin settings.json not found")
+        sys.exit(1)
+    with open(settings_path) as f:
+        settings = json.load(f)
+    _api_token_cache = settings.get("api.token")
+    if not _api_token_cache:
+        print("ERROR: API token not found. Enable Web Clipper in Joplin:")
+        print("  Tools → Options → Web Clipper → Enable")
+        sys.exit(1)
+    return _api_token_cache
+
+
+def _api_request(method, path, data=None):
+    token = _get_api_token()
+    url = f"http://localhost:{JOPLIN_API_PORT}{path}?token={urllib.parse.quote(token)}"
+    body = json.dumps(data).encode() if data else None
+    req = urllib.request.Request(url, data=body, method=method)
+    if body:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read()
+        if not raw:
+            return {}
+        return json.loads(raw)
+
+
+def _api_ping():
+    token = _get_api_token()
+    url = f"http://localhost:{JOPLIN_API_PORT}/ping?token={urllib.parse.quote(token)}"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        return resp.read().decode()
+
+
+def _api_post(path, data):
+    return _api_request("POST", path, data)
+
+
+def _api_put(path, data):
+    return _api_request("PUT", path, data)
+
+
+## ---------------------------------------------------------------------------
+## Sync Nextcloud → Joplin
+## ---------------------------------------------------------------------------
+
+def _build_joplin_note_map(cur, folders):
+    """Build lowercase-path → {id, title, parent_id, utime} from Joplin DB."""
+    cur.execute("""
+        SELECT id, title, parent_id, updated_time, markup_language
+        FROM notes
+        WHERE deleted_time = 0 AND is_conflict = 0
+    """)
+    notes = {}
+    used_paths = set()
+    for nid, title, parent_id, utime, markup in cur.fetchall():
+        if markup == 2:
+            continue
+        folder_path = folders[parent_id]["path"] if parent_id in folders else ""
+        filename = sanitize_filename(title) + ".md"
+        note_path = os.path.join(folder_path, filename)
+        if note_path.lower() in used_paths:
+            filename = f"{sanitize_filename(title)}_{nid[:8]}.md"
+            note_path = os.path.join(folder_path, filename)
+        used_paths.add(note_path.lower())
+        notes[note_path.lower()] = {
+            "id": nid, "title": title, "parent_id": parent_id, "utime": utime,
+        }
+    return notes
+
+
+def _ensure_folder(folder_path, folder_path_to_id, dry_run):
+    """Create Joplin folder hierarchy as needed. Returns the leaf folder ID."""
+    if not folder_path:
+        return ""
+    if folder_path in folder_path_to_id:
+        return folder_path_to_id[folder_path]
+
+    parts = Path(folder_path).parts
+    current = ""
+    parent_id = ""
+    for part in parts:
+        current = os.path.join(current, part) if current else part
+        if current in folder_path_to_id:
+            parent_id = folder_path_to_id[current]
+            continue
+        if dry_run:
+            fake_id = f"dry_{current}"
+            folder_path_to_id[current] = fake_id
+            parent_id = fake_id
+            print(f"  WOULD CREATE FOLDER: {current}")
+            continue
+        payload = {"title": part}
+        if parent_id:
+            payload["parent_id"] = parent_id
+        result = _api_post("/folders", payload)
+        parent_id = result["id"]
+        folder_path_to_id[current] = parent_id
+        print(f"  CREATED FOLDER: {current}")
+    return parent_id
+
+
+def sync_to_joplin(dry_run=False):
+    """Push new/modified Nextcloud notes into Joplin via the REST API."""
+    from datetime import datetime, timezone
+
+    if not JOPLIN_DB.exists():
+        print(f"ERROR: Joplin database not found at {JOPLIN_DB}")
+        sys.exit(1)
+
+    try:
+        _api_ping()
+    except Exception:
+        print("ERROR: Cannot reach Joplin API on localhost:41184")
+        print("Make sure Joplin is running and Web Clipper is enabled.")
+        sys.exit(1)
+
+    conn = sqlite3.connect(f"file:{JOPLIN_DB}?mode=ro", uri=True)
+    cur = conn.cursor()
+    folders = build_folder_tree(cur)
+    joplin_notes = _build_joplin_note_map(cur, folders)
+    conn.close()
+
+    folder_path_to_id = {info["path"]: fid for fid, info in folders.items()}
+
+    mode = "DRY RUN — " if dry_run else ""
+    print(f"=== {mode}SYNC TO JOPLIN ===")
+    print(f"Scanning {NEXTCLOUD_NOTES}\n")
+
+    stats = {"new": 0, "modified": 0, "unchanged": 0, "errors": 0,
+             "folders_created": 0}
+
+    for root, dirs, files in os.walk(NEXTCLOUD_NOTES):
+        dirs[:] = [d for d in dirs if d != ATTACHMENTS_DIR]
+        for fname in sorted(files):
+            if not fname.endswith(".md"):
+                continue
+
+            full_path = Path(root) / fname
+            rel_path = str(full_path.relative_to(NEXTCLOUD_NOTES))
+            nc_mtime = full_path.stat().st_mtime
+
+            match = joplin_notes.get(rel_path.lower())
+
+            if match and nc_mtime <= match["utime"] / 1000 + 1:
+                stats["unchanged"] += 1
+                continue
+
+            folder_path = str(Path(rel_path).parent)
+            if folder_path == ".":
+                folder_path = ""
+            note_title = match["title"] if match else Path(fname).stem
+
+            body = full_path.read_text(encoding="utf-8")
+
+            # Strip the TODO prefix added during Joplin→Nextcloud export
+            todo_match = re.match(r'^\*\*TODO \[([ x])\]\*\*\n\n', body)
+            is_todo = bool(todo_match)
+            todo_completed = (todo_match.group(1) == "x") if todo_match else False
+            if todo_match:
+                body = body[todo_match.end():]
+
+            nc_dt = datetime.fromtimestamp(nc_mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%d %H:%M")
+
+            if match is None:
+                # --- NEW note ---
+                parent_id = _ensure_folder(folder_path, folder_path_to_id,
+                                           dry_run)
+                if dry_run:
+                    print(f"  WOULD CREATE: {rel_path}  ({nc_dt})")
+                else:
+                    note_data = {"title": note_title, "body": body,
+                                 "parent_id": parent_id}
+                    if is_todo:
+                        note_data["is_todo"] = 1
+                        note_data["todo_completed"] = (
+                            int(datetime.now(timezone.utc).timestamp() * 1000)
+                            if todo_completed else 0)
+                    try:
+                        result = _api_post("/notes", note_data)
+                        print(f"  CREATED: {rel_path}  ({nc_dt})")
+                    except urllib.error.URLError as e:
+                        print(f"  ERROR creating {rel_path}: {e}")
+                        stats["errors"] += 1
+                        continue
+                stats["new"] += 1
+
+            else:
+                # --- MODIFIED note ---
+                joplin_dt = datetime.fromtimestamp(
+                    match["utime"] / 1000, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M")
+                if dry_run:
+                    print(f"  WOULD UPDATE: {rel_path}  "
+                          f"(NC: {nc_dt} > Joplin: {joplin_dt})")
+                else:
+                    note_data = {"body": body}
+                    if is_todo:
+                        note_data["is_todo"] = 1
+                        note_data["todo_completed"] = (
+                            int(datetime.now(timezone.utc).timestamp() * 1000)
+                            if todo_completed else 0)
+                    try:
+                        _api_put(f"/notes/{match['id']}", note_data)
+                        print(f"  UPDATED: {rel_path}  "
+                              f"(NC: {nc_dt} > Joplin: {joplin_dt})")
+                    except urllib.error.URLError as e:
+                        print(f"  ERROR updating {rel_path}: {e}")
+                        stats["errors"] += 1
+                        continue
+                stats["modified"] += 1
+
+    print(f"\n=== {'DRY RUN ' if dry_run else ''}SUMMARY ===")
+    print(f"  New notes:      {stats['new']}")
+    print(f"  Updated notes:  {stats['modified']}")
+    print(f"  Unchanged:      {stats['unchanged']}")
+    if stats["errors"]:
+        print(f"  Errors:         {stats['errors']}")
+    total = stats["new"] + stats["modified"]
+    if total == 0:
+        print("\n  Everything is in sync.")
+    else:
+        verb = "would be" if dry_run else "were"
+        print(f"\n  {total} note(s) {verb} synced to Joplin.")
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Migrate Joplin notes to Nextcloud Notes")
+    parser = argparse.ArgumentParser(
+        description="Migrate notes between Joplin and Nextcloud Notes")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Show what would be done without writing files")
+                        help="Show what would be done without writing")
     parser.add_argument("--diff", action="store_true",
                         help="Show only new/modified notes since last sync")
     parser.add_argument("--reverse-diff", action="store_true",
                         help="Find Nextcloud notes that are new or modified compared to Joplin")
+    parser.add_argument("--sync-to-joplin", action="store_true",
+                        help="Push new/modified Nextcloud notes into Joplin via API")
     args = parser.parse_args()
-    if args.reverse_diff:
+    if args.sync_to_joplin:
+        sync_to_joplin(dry_run=args.dry_run)
+    elif args.reverse_diff:
         reverse_diff()
     else:
         migrate(dry_run=args.dry_run, diff=args.diff)
