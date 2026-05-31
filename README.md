@@ -12,6 +12,7 @@ The script reads directly from the Joplin SQLite database and writes standard ma
 - Preserves original created/updated timestamps
 - Marks todo notes with a checkbox prefix
 - Handles duplicate filenames and sanitizes special characters
+- Incremental sync: unchanged notes are skipped, only new/modified ones are written
 - `--sync-to-joplin` to push Nextcloud changes back into Joplin via REST API
 - `--dry-run` mode to preview without writing
 - `--diff` mode to detect new and modified notes since the last sync
@@ -44,6 +45,27 @@ python3 joplin_to_nextcloud.py --sync-to-joplin [--dry-run]
 | `--diff` | Lists Joplin notes that are new or modified compared to Nextcloud |
 | `--reverse-diff` | Lists Nextcloud notes that are new or modified compared to Joplin |
 | `--sync-to-joplin` | Pushes new/modified Nextcloud notes into Joplin via the REST API |
+
+### Migration (Joplin → Nextcloud)
+
+The default mode is incremental: only new or modified notes are written, unchanged notes are skipped.
+
+```
+$ python3 joplin_to_nextcloud.py
+
+Found 384 notes in 34 folders
+Found 281 resources
+  CREATED: 06_Development/New Project.md
+  UPDATED: 01_Home/Shopping List.md (+1 resources)
+
+=== SUMMARY ===
+  New notes:         1
+  Updated notes:     1
+  Unchanged notes:   382
+  Resources copied:  1
+  Skipped (HTML):    0
+  Total resources:   1 unique files
+```
 
 ### Diff Mode (Joplin → Nextcloud)
 
@@ -132,13 +154,15 @@ To use different paths, edit the constants at the top of the script.
 
 1. Opens the Joplin SQLite database in **read-only** mode
 2. Builds the notebook folder hierarchy
-3. For each note:
-   - Creates a `.md` file named after the note title
+3. For each note, compares the Joplin `updated_time` against the Nextcloud file mtime and classifies it as new, modified, or unchanged
+4. For new and modified notes:
+   - Creates or overwrites a `.md` file named after the note title
    - Places it in the folder matching its Joplin notebook
    - Rewrites Joplin resource references (`(:/abc123...)`) to relative paths
    - Copies referenced resource files to `attachments/`
    - Sets the file's mtime to the Joplin `updated_time`
-4. The Nextcloud Desktop Client syncs the files automatically
+5. Unchanged notes are skipped entirely
+6. The Nextcloud Desktop Client syncs the files automatically
 
 ## Limitations
 
