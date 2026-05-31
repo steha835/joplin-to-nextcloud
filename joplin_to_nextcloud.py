@@ -307,44 +307,32 @@ def migrate(dry_run: bool = False, diff: bool = False):
                 print(f"  MODIFIED: {note_path}  (Joplin: {joplin_dt} > Nextcloud: {nc_dt})")
             continue
 
+        if status == "unchanged":
+            continue
+
+        if is_todo:
+            checkbox = "[x]" if todo_completed else "[ ]"
+            body = f"**TODO {checkbox}**\n\n{body}"
+
+        prev_copied = len(copied_resources)
+        body = rewrite_resource_links(
+            body, resources, folder_path, attachments_base, copied_resources, dry_run
+        )
+        new_resources = len(copied_resources) - prev_copied
+
         if dry_run:
-            # Add todo checkbox prefix if it's a todo item
-            if is_todo:
-                checkbox = "[x]" if todo_completed else "[ ]"
-                body = f"**TODO {checkbox}**\n\n{body}"
-
-            action = "WOULD CREATE"
+            action = "WOULD UPDATE" if status == "modified" else "WOULD CREATE"
         else:
-            # Add todo checkbox prefix if it's a todo item
-            if is_todo:
-                checkbox = "[x]" if todo_completed else "[ ]"
-                body = f"**TODO {checkbox}**\n\n{body}"
-
-            # Rewrite resource links
-            prev_copied = len(copied_resources)
-            body = rewrite_resource_links(
-                body, resources, folder_path, attachments_base, copied_resources, dry_run
-            )
-            new_resources = len(copied_resources) - prev_copied
-
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(body, encoding="utf-8")
-
             if ctime and utime:
                 os.utime(full_path, (utime / 1000, utime / 1000))
-            action = "CREATED"
+            action = "UPDATED" if status == "modified" else "CREATED"
 
         stats["notes"] += 1
-        if not diff:
-            # Rewrite resource links for dry-run display
-            if dry_run:
-                prev_copied = len(copied_resources)
-                body = rewrite_resource_links(
-                    body, resources, folder_path, attachments_base, copied_resources, dry_run
-                )
-                new_resources = len(copied_resources) - prev_copied
-            res_info = f" (+{new_resources} resources)" if new_resources else ""
-            print(f"  {action}: {note_path}{res_info}")
+        stats["resources"] += new_resources
+        res_info = f" (+{new_resources} resources)" if new_resources else ""
+        print(f"  {action}: {note_path}{res_info}")
 
     conn.close()
 
@@ -356,7 +344,9 @@ def migrate(dry_run: bool = False, diff: bool = False):
         print(f"  Skipped (HTML):    {stats['skipped_html']}")
     else:
         print(f"\n{'=== DRY RUN SUMMARY ===' if dry_run else '=== SUMMARY ==='}")
-        print(f"  Notes migrated:    {stats['notes']}")
+        print(f"  New notes:         {stats['new']}")
+        print(f"  Updated notes:     {stats['modified']}")
+        print(f"  Unchanged notes:   {stats['unchanged']}")
         print(f"  Resources copied:  {stats['resources']}")
         print(f"  Skipped (HTML):    {stats['skipped_html']}")
         print(f"  Total resources:   {len(copied_resources)} unique files")
